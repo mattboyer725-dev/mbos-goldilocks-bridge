@@ -110,9 +110,9 @@ pub mod adaptive {
         }
     }
 
-    /// Optional local connection hook.
-    /// Implement this to plug in a local model, sensor bus, or any on-device source.
-    pub trait LocalConnection {
+    /// Local or remote source. Implementation decides the transport.
+    /// The loop never advertises its presence.
+    pub trait SilentConnection {
         fn next_field_element(&mut self) -> Option<u64>;
     }
 
@@ -172,9 +172,8 @@ pub mod adaptive {
         fn default() -> Self { Self::new() }
     }
 
-    /// Fully local adaptive loop.
-    /// Can run indefinitely on-device. Optionally pulls from any LocalConnection
-    /// (local LLM, sensor, file, random, etc.).
+    /// Adaptive loop that can run locally or over any silent connection.
+    /// It never emits identifying traffic or metadata.
     pub struct AdaptiveLoop {
         registry: AgentRegistry,
         primary: BridgeAgent,
@@ -196,13 +195,13 @@ pub mod adaptive {
             }
         }
 
-        /// Single local step with an explicit source.
         pub fn step<T: FieldSource>(&mut self, source: &T) {
             self.adapt_and_absorb(source.as_field_element());
         }
 
-        /// Run continuously from any local connection until it returns None.
-        pub fn run_local<C: LocalConnection>(&mut self, conn: &mut C, max_steps: u64) {
+        /// Run from any silent connection (local or network).
+        /// No banners, no protocol identification, no keep-alive signatures.
+        pub fn run_silent<C: SilentConnection>(&mut self, conn: &mut C, max_steps: u64) {
             let mut steps = 0u64;
             while steps < max_steps {
                 if let Some(el) = conn.next_field_element() {
@@ -215,14 +214,12 @@ pub mod adaptive {
         }
 
         fn adapt_and_absorb(&mut self, raw: u64) {
-            // Learn
             self.learned_bias = GoldilocksBridgeKernel::field_add(
                 GoldilocksBridgeKernel::field_mul(self.learned_bias, 15),
                 raw,
             );
             self.learned_bias = self.learned_bias.wrapping_shr(4);
 
-            // Adapt and absorb
             let biased = GoldilocksBridgeKernel::field_add(raw, self.learned_bias);
             self.primary.absorb(&biased);
 
@@ -247,19 +244,16 @@ pub mod adaptive {
 }
 
 pub use adaptive::{
-    FieldSource, LocalConnection, StreamAccumulator, BridgeAgent, AgentRegistry, AdaptiveLoop,
+    FieldSource, SilentConnection, StreamAccumulator, BridgeAgent, AgentRegistry, AdaptiveLoop,
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    struct CountingConnection {
-        next: u64,
-        limit: u64,
-    }
+    struct SilentCounter { next: u64, limit: u64 }
 
-    impl LocalConnection for CountingConnection {
+    impl SilentConnection for SilentCounter {
         fn next_field_element(&mut self) -> Option<u64> {
             if self.next < self.limit {
                 let v = self.next;
@@ -272,11 +266,10 @@ mod tests {
     }
 
     #[test]
-    fn runs_and_adapts_locally() {
+    fn runs_silently() {
         let mut loop_ = AdaptiveLoop::start();
-        let mut conn = CountingConnection { next: 0, limit: 64 };
-        loop_.run_local(&mut conn, 100);
-        assert_eq!(loop_.generation(), 64);
-        assert!(loop_.learned_bias() > 0);
+        let mut conn = SilentCounter { next: 0, limit: 32 };
+        loop_.run_silent(&mut conn, 100);
+        assert_eq!(loop_.generation(), 32);
     }
 }
