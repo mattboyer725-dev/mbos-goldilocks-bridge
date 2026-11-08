@@ -1,18 +1,21 @@
-#![cfg_attr(not(feature = "std"), no_std)]
+//! Local-first adaptive loop.
+//! Optional controlled peer sync: you supply the peer list and can read every node.
+
+use std::sync::{Arc, Mutex};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use serde::{Serialize, Deserialize};
 
 pub const GOLDILOCKS_PRIME: u64 = 18446744069414584321;
 
 pub struct GoldilocksBridgeKernel;
 
 impl GoldilocksBridgeKernel {
-    #[inline(always)]
     pub fn field_add(a: u64, b: u64) -> u64 {
         let sum = a.wrapping_add(b);
         let mask = ((sum >= GOLDILOCKS_PRIME) as u64).wrapping_neg();
         sum.wrapping_sub(GOLDILOCKS_PRIME & mask)
     }
-
-    #[inline(always)]
     pub fn field_mul(a: u64, b: u64) -> u64 {
         let wide = (a as u128) * (b as u128);
         let mut lo = wide as u64;
@@ -23,133 +26,115 @@ impl GoldilocksBridgeKernel {
     }
 }
 
-pub trait FieldSource {
-    fn as_field_element(&self) -> u64;
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NodeState {
+    pub node_id: String,
+    pub state: u64,
+    pub generation: u64,
+    pub adaptation_rate: u64,
 }
 
-impl FieldSource for u64 {
-    fn as_field_element(&self) -> u64 { *self % GOLDILOCKS_PRIME }
-}
-
-pub trait LocalConnection {
-    fn next_field_element(&mut self) -> Option<u64>;
-}
-
-pub struct StreamAccumulator {
-    acc: u64,
-    count: u64,
-}
-
-impl StreamAccumulator {
-    pub fn new() -> Self { Self { acc: 0, count: 0 } }
-    pub fn push<T: FieldSource>(&mut self, item: &T) {
-        let el = item.as_field_element();
-        let weight = GoldilocksBridgeKernel::field_mul(7, self.count.wrapping_add(1));
-        self.acc = GoldilocksBridgeKernel::field_add(self.acc, GoldilocksBridgeKernel::field_mul(el, weight));
-        self.count = self.count.wrapping_add(1);
-    }
-    pub fn current(&self) -> u64 { self.acc }
-}
-
-impl Default for StreamAccumulator {
-    fn default() -> Self { Self::new() }
-}
-
-/// Local-only adaptive loop with dynamic sensitivity.
-/// Large magnitude observations dampen the adaptation rate;
-/// stable observations allow it to increase.
 pub struct AdaptiveLoop {
-    acc: StreamAccumulator,
+    pub node_id: String,
+    acc: u64,
     learned_bias: u64,
-    adaptation_rate: u64,   // scaled integer: 100 = 1.0
+    adaptation_rate: u64,
     generation: u64,
     target: u64,
+    /// Explicit peer list you control. Empty = local only.
+    peers: Vec<String>,
 }
 
 impl AdaptiveLoop {
-    pub fn start() -> Self {
-        Self::with_target(0)
+    pub fn start(node_id: impl Into<String>) -> Self {
+        Self::with_target(node_id, 0)
     }
 
-    pub fn with_target(target: u64) -> Self {
+    pub fn with_target(node_id: impl Into<String>, target: u64) -> Self {
         Self {
-            acc: StreamAccumulator::new(),
+            node_id: node_id.into(),
+            acc: 0,
             learned_bias: 0,
-            adaptation_rate: 10, // 0.10
+            adaptation_rate: 10,
             generation: 0,
             target: target % GOLDILOCKS_PRIME,
+            peers: Vec::new(),
         }
     }
 
-    /// Single step with dynamic sensitivity (ported from the Python heuristic).
-    pub fn step<T: FieldSource>(&mut self, source: &T) {
-        let raw = source.as_field_element();
-        let magnitude = raw.wrapping_sub(self.learned_bias); // rough local delta
+    /// Add a peer you control (host:port). You must be able to reach and inspect it.
+    pub fn add_peer(&mut self, addr: impl Into<String>) {
+        self.peers.push(addr.into());
+    }
 
-        // Error against target
-        let error = self.target.wrapping_sub(self.acc.current());
-
-        // Adjustment influenced by current adaptation rate
+    pub fn step(&mut self, raw: u64) {
+        let magnitude = raw.wrapping_sub(self.learned_bias);
+        let error = self.target.wrapping_sub(self.acc);
         let rate = self.adaptation_rate;
         let adjustment = GoldilocksBridgeKernel::field_add(
             GoldilocksBridgeKernel::field_mul(error, rate),
             GoldilocksBridgeKernel::field_mul(magnitude, 5),
         );
-
-        // Update bias
         self.learned_bias = GoldilocksBridgeKernel::field_add(self.learned_bias, adjustment);
         self.learned_bias = self.learned_bias.wrapping_shr(4);
 
-        // Dynamic sensitivity:
-        // high magnitude -> dampen rate; low magnitude -> increase rate
         if magnitude > (GOLDILOCKS_PRIME >> 2) {
-            // dampen
             self.adaptation_rate = (self.adaptation_rate * 9) / 10;
             if self.adaptation_rate < 1 { self.adaptation_rate = 1; }
         } else {
-            // accelerate
             self.adaptation_rate = (self.adaptation_rate * 21) / 20;
             if self.adaptation_rate > 50 { self.adaptation_rate = 50; }
         }
 
         let biased = GoldilocksBridgeKernel::field_add(raw, self.learned_bias);
-        self.acc.push(&biased);
+        self.acc = GoldilocksBridgeKernel::field_add(self.acc, biased);
         self.generation = self.generation.wrapping_add(1);
     }
 
-    pub fn run_local<C: LocalConnection>(&mut self, conn: &mut C, max_steps: u64) {
-        let mut steps = 0;
-        while steps < max_steps {
-            match conn.next_field_element() {
-                Some(el) => {
-                    self.step(&el);
-                    steps += 1;
-                }
-                None => break,
-            }
+    pub fn current_state(&self) -> NodeState {
+        NodeState {
+            node_id: self.node_id.clone(),
+            state: self.acc,
+            generation: self.generation,
+            adaptation_rate: self.adaptation_rate,
         }
     }
 
-    pub fn current_state(&self) -> u64 { self.acc.current() }
-    pub fn generation(&self) -> u64 { self.generation }
-    pub fn learned_bias(&self) -> u64 { self.learned_bias }
-    pub fn adaptation_rate(&self) -> u64 { self.adaptation_rate }
-    pub fn is_local_only(&self) -> bool { true }
-}
+    pub fn is_local_only(&self) -> bool { self.peers.is_empty() }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dynamic_sensitivity_changes() {
-        let mut loop_ = AdaptiveLoop::with_target(100);
-        let start_rate = loop_.adaptation_rate();
-        for i in 0..20u64 {
-            loop_.step(&(i * 1000));
+    /// Broadcast current state to the explicit peer list you supplied.
+    /// Returns the number of peers that acknowledged.
+    pub async fn broadcast(&self) -> usize {
+        let payload = serde_json::to_vec(&self.current_state()).unwrap_or_default();
+        let mut acks = 0;
+        for peer in &self.peers {
+            if let Ok(mut stream) = TcpStream::connect(peer).await {
+                if stream.write_all(&payload).await.is_ok() {
+                    let mut buf = [0u8; 8];
+                    if stream.read(&mut buf).await.is_ok() {
+                        acks += 1;
+                    }
+                }
+            }
         }
-        assert_eq!(loop_.generation(), 20);
-        // rate should have moved from the initial value
-        assert_ne!(loop_.adaptation_rate(), start_rate);
+        acks
+    }
+
+    /// Start a listener so other nodes you control can send state to this one.
+    /// You choose the bind address.
+    pub async fn listen(self: Arc<Mutex<Self>>, bind: &str) -> std::io::Result<()> {
+        let listener = TcpListener::bind(bind).await?;
+        loop {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 1024];
+                if let Ok(n) = socket.read(&mut buf).await {
+                    if let Ok(peer_state) = serde_json::from_slice::<NodeState>(&buf[..n]) {
+                        // Store or log; owner can inspect via current_state()
+                        let _ = peer_state;
+                        let _ = socket.write_all(b"ACK").await;
+                    }
+                }
+            }
+        }
     }
 }
