@@ -94,8 +94,6 @@ impl AdaptiveLoop {
     }
 }
 
-/// Strip dynamic-loader environment variables before any other work.
-/// Call this at the absolute start of main().
 pub fn sanitize_loader_env() {
     std::env::remove_var("LD_PRELOAD");
     std::env::remove_var("LD_LIBRARY_PATH");
@@ -175,7 +173,6 @@ impl IntegrityAuditor {
         Ok(new_files == 0 && deleted == 0 && modified == 0)
     }
 
-    /// Refuse if the target directory is writable by the current process.
     pub fn assert_read_only(&self) -> io::Result<()> {
         let meta = fs::metadata(&self.target_dir)?;
         if meta.permissions().readonly() {
@@ -186,17 +183,16 @@ impl IntegrityAuditor {
     }
 }
 
-/// Hardened boot: sanitize loader env, optionally require read-only dir, then audit, then run.
+/// Hardened boot: sanitize env, require read-only directory, then audit, then run.
 pub fn boot_and_run(node_id: &str, target: u64, dir: &Path) -> Result<(), String> {
     sanitize_loader_env();
 
     let manifest = dir.join("baseline_manifest.json");
     let auditor = IntegrityAuditor::new(dir, &manifest);
 
-    // Soft check: warn path is writable; do not fail closed unless caller wants it.
-    if auditor.assert_read_only().is_err() {
-        // continue; caller may remount later
-    }
+    // Hard check: refuse to start if directory is writable
+    auditor.assert_read_only()
+        .map_err(|e| format!("directory not read-only: {e}"))?;
 
     match auditor.audit() {
         Ok(true) => {}
