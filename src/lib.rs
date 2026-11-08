@@ -33,6 +33,15 @@ pub struct NodeState {
     pub adaptation_rate: u64,
 }
 
+/// Multi-source local telemetry.
+pub struct Telemetry {
+    pub target_equilibrium: u64,
+    pub system_load: u64,   // 0..=100
+    pub state_drift: u64,
+}
+
+/// Local multi-source adaptive loop.
+/// Load dampens the rate; drift is counter-weighted; values stay in-field.
 pub struct AdaptiveLoop {
     pub node_id: String,
     acc: u64,
@@ -54,28 +63,36 @@ impl AdaptiveLoop {
         }
     }
 
-    pub fn step(&mut self, raw: u64) {
-        let magnitude = raw.wrapping_sub(self.learned_bias);
-        let error = self.target.wrapping_sub(self.acc);
-        let rate = self.adaptation_rate;
-        let adjustment = GoldilocksBridgeKernel::field_add(
-            GoldilocksBridgeKernel::field_mul(error, rate),
-            GoldilocksBridgeKernel::field_mul(magnitude, 5),
-        );
-        self.learned_bias = GoldilocksBridgeKernel::field_add(self.learned_bias, adjustment);
+    /// Single step driven by multi-source telemetry.
+    pub fn step_telemetry(&mut self, t: &Telemetry) {
+        let load = t.system_load.min(100);
+        // High load dampens (scale 100 -> 10)
+        let load_attenuation = 100u64.saturating_sub(load).max(10);
+
+        let base_error = t.target_equilibrium.wrapping_sub(self.acc);
+        let drift_term = t.state_drift / 2;
+        let composite = base_error.wrapping_sub(drift_term);
+        let adjusted = GoldilocksBridgeKernel::field_mul(composite, load_attenuation);
+
+        self.learned_bias = GoldilocksBridgeKernel::field_add(self.learned_bias, adjusted);
         self.learned_bias = self.learned_bias.wrapping_shr(4);
 
-        if magnitude > (GOLDILOCKS_PRIME >> 2) {
-            self.adaptation_rate = (self.adaptation_rate * 9) / 10;
-            if self.adaptation_rate < 1 { self.adaptation_rate = 1; }
-        } else {
-            self.adaptation_rate = (self.adaptation_rate * 21) / 20;
-            if self.adaptation_rate > 50 { self.adaptation_rate = 50; }
-        }
+        // Rate follows load attenuation
+        self.adaptation_rate = (load_attenuation / 2).max(1).min(50);
 
-        let biased = GoldilocksBridgeKernel::field_add(raw, self.learned_bias);
+        let biased = GoldilocksBridgeKernel::field_add(t.target_equilibrium, self.learned_bias);
         self.acc = GoldilocksBridgeKernel::field_add(self.acc, biased);
         self.generation = self.generation.wrapping_add(1);
+        self.target = t.target_equilibrium % GOLDILOCKS_PRIME;
+    }
+
+    pub fn step(&mut self, raw: u64) {
+        let t = Telemetry {
+            target_equilibrium: self.target,
+            system_load: 10,
+            state_drift: raw.wrapping_sub(self.learned_bias),
+        };
+        self.step_telemetry(&t);
     }
 
     pub fn current_state(&self) -> NodeState {
@@ -173,7 +190,6 @@ impl IntegrityAuditor {
         Ok(new_files == 0 && deleted == 0 && modified == 0)
     }
 
-    /// Hard gate: fail if the directory is writable by anyone.
     pub fn assert_read_only(&self) -> io::Result<()> {
         let metadata = fs::metadata(&self.target_dir)?;
         let permissions = metadata.permissions();
@@ -186,7 +202,6 @@ impl IntegrityAuditor {
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = permissions.mode();
-            // S_IWUSR | S_IWGRP | S_IWOTH
             if mode & 0o222 != 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
