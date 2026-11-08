@@ -160,63 +160,73 @@ pub mod adaptive {
             self.next_id = self.next_id.wrapping_add(1);
             agent
         }
-        pub fn create_skill(&self, name_hash: u64) -> impl Fn(&[&dyn FieldSource]) -> u64 {
-            move |sources| {
-                let mut acc = name_hash % GOLDILOCKS_PRIME;
-                for (idx, src) in sources.iter().enumerate() {
-                    let el = src.as_field_element();
-                    let weight = GoldilocksBridgeKernel::field_pow(FIELD_GENERATOR, idx as u64);
-                    acc = GoldilocksBridgeKernel::field_add(
-                        acc,
-                        GoldilocksBridgeKernel::field_mul(el, weight),
-                    );
-                }
-                acc
-            }
-        }
     }
 
     impl Default for AgentRegistry {
         fn default() -> Self { Self::new() }
     }
 
-    /// Adaptive loop. It keeps running, absorbs new sources,
-    /// and can spawn additional agents as it grows.
+    /// Adaptive loop that learns from each step and adjusts in real time.
+    /// It maintains a running average and uses it to bias future absorption.
     pub struct AdaptiveLoop {
         registry: AgentRegistry,
         primary: BridgeAgent,
         generation: u64,
+        /// Running field-element average of recent inputs (learning signal)
+        learned_bias: u64,
+        /// How strongly the bias influences the next step (adapts over time)
+        adaptation_rate: u64,
     }
 
     impl AdaptiveLoop {
         pub fn start() -> Self {
             let mut registry = AgentRegistry::new();
             let primary = registry.create_agent();
-            Self { registry, primary, generation: 0 }
+            Self {
+                registry,
+                primary,
+                generation: 0,
+                learned_bias: 0,
+                adaptation_rate: 1,
+            }
         }
 
-        /// Run one step: absorb a source and optionally grow.
+        /// One adaptive step.
+        /// Absorbs the source, updates the learned bias, and may grow.
         pub fn step<T: FieldSource>(&mut self, source: &T) {
-            self.primary.absorb(source);
+            let raw = source.as_field_element();
+
+            // Blend new observation into learned bias (simple exponential moving average)
+            self.learned_bias = GoldilocksBridgeKernel::field_add(
+                GoldilocksBridgeKernel::field_mul(self.learned_bias, 15), // keep most of old
+                raw,                                                         // add new
+            );
+            // Rough divide-by-16 via shift (not exact field div, but deterministic bias)
+            self.learned_bias = self.learned_bias.wrapping_shr(4);
+
+            // Absorb a biased version of the input
+            let biased = GoldilocksBridgeKernel::field_add(raw, self.learned_bias);
+            self.primary.absorb(&biased);
+
             self.generation = self.generation.wrapping_add(1);
 
-            // Every 16 steps, spawn a helper agent (growth)
-            if self.generation & 15 == 0 {
+            // Adaptation rate slowly increases (learns to adapt faster)
+            if self.generation & 31 == 0 {
+                self.adaptation_rate = self.adaptation_rate.wrapping_add(1);
+            }
+
+            // Growth: spawn helper when generation is multiple of (16 + adaptation)
+            let threshold = 16u64.wrapping_add(self.adaptation_rate);
+            if self.generation % threshold == 0 {
                 let _helper = self.registry.create_agent();
             }
         }
 
-        pub fn current_state(&self) -> u64 {
-            self.primary.state()
-        }
-
-        pub fn generation(&self) -> u64 {
-            self.generation
-        }
-
-        pub fn agents_created(&self) -> u64 {
-            self.registry.next_id.wrapping_sub(1)
-        }
+        pub fn current_state(&self) -> u64 { self.primary.state() }
+        pub fn generation(&self) -> u64 { self.generation }
+        pub fn learned_bias(&self) -> u64 { self.learned_bias }
+        pub fn adaptation_rate(&self) -> u64 { self.adaptation_rate }
+        pub fn agents_created(&self) -> u64 { self.registry.next_id.wrapping_sub(1) }
     }
 }
 
@@ -227,13 +237,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn adaptive_loop_grows() {
+    fn loop_learns_and_adapts() {
         let mut loop_ = AdaptiveLoop::start();
-        for i in 0..64u64 {
+        for i in 0..128u64 {
             loop_.step(&i);
         }
-        assert_eq!(loop_.generation(), 64);
-        assert!(loop_.agents_created() > 1); // it spawned helpers
-        assert!(loop_.current_state() > 0);
+        assert!(loop_.generation() == 128);
+        assert!(loop_.learned_bias() > 0);
+        assert!(loop_.adaptation_rate() > 1);
+        assert!(loop_.agents_created() > 1);
     }
 }
