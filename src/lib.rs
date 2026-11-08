@@ -15,6 +15,7 @@ pub struct HardwareInterrupt {
     pub data_signal: u64,
 }
 
+/// Core kernel. All operations are associated functions or methods on this unit struct.
 pub struct GoldilocksBridgeKernel;
 
 impl GoldilocksBridgeKernel {
@@ -32,16 +33,13 @@ impl GoldilocksBridgeKernel {
         diff.wrapping_add(GOLDILOCKS_PRIME & mask)
     }
 
-    /// Wider reduction for multiplication. Still not fully constant-time on the final mod,
-    /// but avoids a generic division in the hot path.
     #[inline(always)]
     pub fn field_mul(a: u64, b: u64) -> u64 {
         let wide = (a as u128) * (b as u128);
         let mut lo = wide as u64;
         let hi = (wide >> 64) as u64;
-        // Approximate reduction using the Goldilocks relation 2^64 ≡ 2^32 - 1
         lo = lo.wrapping_sub(hi);
-        if lo > GOLDILOCKS_PRIME { // note: still has a branch
+        if lo > GOLDILOCKS_PRIME {
             lo.wrapping_sub(GOLDILOCKS_PRIME)
         } else {
             lo
@@ -105,6 +103,41 @@ impl GoldilocksBridgeKernel {
     }
 }
 
+/// Extension point: anything that can produce a field element can be folded in.
+pub trait FieldSource {
+    fn as_field_element(&self) -> u64;
+}
+
+impl FieldSource for u64 {
+    fn as_field_element(&self) -> u64 { *self % GOLDILOCKS_PRIME }
+}
+
+impl FieldSource for HardwareInterrupt {
+    fn as_field_element(&self) -> u64 {
+        GoldilocksBridgeKernel::field_mul(
+            self.vector_id % GOLDILOCKS_PRIME,
+            self.data_signal % GOLDILOCKS_PRIME,
+        )
+    }
+}
+
+/// Adapter that lets external systems feed arbitrary sources into the bridge.
+pub struct BridgeAdapter;
+
+impl BridgeAdapter {
+    /// Fold any number of FieldSource items into a single commitment-like value.
+    pub fn fold_sources(sources: &[&dyn FieldSource]) -> u64 {
+        let mut acc = 0u64;
+        for (idx, src) in sources.iter().enumerate() {
+            let el = src.as_field_element();
+            let weight = GoldilocksBridgeKernel::field_pow(FIELD_GENERATOR, idx as u64);
+            let term = GoldilocksBridgeKernel::field_mul(el, weight);
+            acc = GoldilocksBridgeKernel::field_add(acc, term);
+        }
+        acc
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +158,14 @@ mod tests {
         let (s1, s2) = kernel.generate_masked_shares(secret, 0x44A21B90);
         let recovered = GoldilocksBridgeKernel::field_add(s1, s2);
         assert_eq!(recovered, secret);
+    }
+
+    #[test]
+    fn adapter_folds_mixed_sources() {
+        let irq = HardwareInterrupt { vector_id: 7, data_signal: 99 };
+        let raw: u64 = 0xABCDEF;
+        let sources: [&dyn FieldSource; 2] = [&raw, &irq];
+        let folded = BridgeAdapter::fold_sources(&sources);
+        assert!(folded > 0);
     }
 }
