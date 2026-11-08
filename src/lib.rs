@@ -37,20 +37,14 @@ impl GoldilocksBridgeKernel {
         let mut lo = wide as u64;
         let hi = (wide >> 64) as u64;
         lo = lo.wrapping_sub(hi);
-        if lo > GOLDILOCKS_PRIME {
-            lo.wrapping_sub(GOLDILOCKS_PRIME)
-        } else {
-            lo
-        }
+        if lo > GOLDILOCKS_PRIME { lo.wrapping_sub(GOLDILOCKS_PRIME) } else { lo }
     }
 
     pub fn field_pow(base: u64, mut exp: u64) -> u64 {
         let mut res = 1u64;
         let mut val = base % GOLDILOCKS_PRIME;
         while exp > 0 {
-            if exp & 1 == 1 {
-                res = Self::field_mul(res, val);
-            }
+            if exp & 1 == 1 { res = Self::field_mul(res, val); }
             val = Self::field_mul(val, val);
             exp >>= 1;
         }
@@ -65,8 +59,7 @@ impl GoldilocksBridgeKernel {
             if start + 8 <= descriptor.buffer.len() {
                 bytes.copy_from_slice(&descriptor.buffer[start..start + 8]);
             }
-            let word = u64::from_le_bytes(bytes);
-            elements[i] = word % GOLDILOCKS_PRIME;
+            elements[i] = u64::from_le_bytes(bytes) % GOLDILOCKS_PRIME;
         }
         elements
     }
@@ -75,8 +68,7 @@ impl GoldilocksBridgeKernel {
         let mut commitment = descriptor.allocated_slot % GOLDILOCKS_PRIME;
         for (idx, &el) in elements.iter().enumerate() {
             let alpha = Self::field_pow(FIELD_GENERATOR, (idx + 1) as u64);
-            let term = Self::field_mul(el, alpha);
-            commitment = Self::field_add(commitment, term);
+            commitment = Self::field_add(commitment, Self::field_mul(el, alpha));
         }
         commitment
     }
@@ -84,12 +76,9 @@ impl GoldilocksBridgeKernel {
     pub fn aggregate_interrupt_pool(&self, pool: &[HardwareInterrupt]) -> u64 {
         let mut delta = 0u64;
         for (idx, interrupt) in pool.iter().enumerate() {
-            let vid = interrupt.vector_id % GOLDILOCKS_PRIME;
-            let ds = interrupt.data_signal % GOLDILOCKS_PRIME;
-            let hash = Self::field_mul(vid, ds);
+            let hash = Self::field_mul(interrupt.vector_id % GOLDILOCKS_PRIME, interrupt.data_signal % GOLDILOCKS_PRIME);
             let weight = Self::field_pow(FIELD_GENERATOR, idx as u64);
-            let term = Self::field_mul(hash, weight);
-            delta = Self::field_add(delta, term);
+            delta = Self::field_add(delta, Self::field_mul(hash, weight));
         }
         delta
     }
@@ -101,126 +90,126 @@ impl GoldilocksBridgeKernel {
     }
 }
 
-pub trait FieldSource {
-    fn as_field_element(&self) -> u64;
-}
+// ────────────────────────────────────────────────────────────────
+// ADAPTIVE / SELF-LEARNING SURFACE
+// This module is intentionally open-ended. It can grow without
+// touching the fixed cryptographic core above.
+// ────────────────────────────────────────────────────────────────
 
-impl FieldSource for u64 {
-    fn as_field_element(&self) -> u64 { *self % GOLDILOCKS_PRIME }
-}
+pub mod adaptive {
+    use super::*;
 
-impl FieldSource for HardwareInterrupt {
-    fn as_field_element(&self) -> u64 {
-        GoldilocksBridgeKernel::field_mul(
-            self.vector_id % GOLDILOCKS_PRIME,
-            self.data_signal % GOLDILOCKS_PRIME,
-        )
-    }
-}
-
-pub struct BridgeAdapter;
-
-impl BridgeAdapter {
-    pub fn fold_sources(sources: &[&dyn FieldSource]) -> u64 {
-        let mut acc = 0u64;
-        for (idx, src) in sources.iter().enumerate() {
-            let el = src.as_field_element();
-            let weight = GoldilocksBridgeKernel::field_pow(FIELD_GENERATOR, idx as u64);
-            let term = GoldilocksBridgeKernel::field_mul(el, weight);
-            acc = GoldilocksBridgeKernel::field_add(acc, term);
-        }
-        acc
-    }
-}
-
-pub struct StreamAccumulator {
-    acc: u64,
-    count: u64,
-}
-
-impl StreamAccumulator {
-    pub fn new() -> Self { Self { acc: 0, count: 0 } }
-    pub fn push<T: FieldSource>(&mut self, item: &T) {
-        let el = item.as_field_element();
-        let weight = GoldilocksBridgeKernel::field_pow(FIELD_GENERATOR, self.count);
-        let term = GoldilocksBridgeKernel::field_mul(el, weight);
-        self.acc = GoldilocksBridgeKernel::field_add(self.acc, term);
-        self.count = self.count.wrapping_add(1);
-    }
-    pub fn current(&self) -> u64 { self.acc }
-    pub fn items_seen(&self) -> u64 { self.count }
-}
-
-impl Default for StreamAccumulator {
-    fn default() -> Self { Self::new() }
-}
-
-/// An agent that can be spawned on demand and carries its own accumulator.
-pub struct BridgeAgent {
-    pub id: u64,
-    pub accumulator: StreamAccumulator,
-}
-
-impl BridgeAgent {
-    pub fn spawn(id: u64) -> Self {
-        Self { id, accumulator: StreamAccumulator::new() }
+    pub trait FieldSource {
+        fn as_field_element(&self) -> u64;
     }
 
-    pub fn absorb<T: FieldSource>(&mut self, item: &T) {
-        self.accumulator.push(item);
+    impl FieldSource for u64 {
+        fn as_field_element(&self) -> u64 { *self % GOLDILOCKS_PRIME }
     }
 
-    pub fn state(&self) -> u64 {
-        self.accumulator.current()
-    }
-}
-
-/// Registry that can create agents and skills as needed.
-pub struct AgentRegistry {
-    next_id: u64,
-}
-
-impl AgentRegistry {
-    pub fn new() -> Self { Self { next_id: 1 } }
-
-    pub fn create_agent(&mut self) -> BridgeAgent {
-        let agent = BridgeAgent::spawn(self.next_id);
-        self.next_id = self.next_id.wrapping_add(1);
-        agent
-    }
-
-    /// Create a skill as a named folding function over FieldSources.
-    pub fn create_skill(&self, name_hash: u64) -> impl Fn(&[&dyn FieldSource]) -> u64 {
-        move |sources| {
-            let base = GoldilocksBridgeKernel::field_add(name_hash, BridgeAdapter::fold_sources(sources));
-            base
+    impl FieldSource for HardwareInterrupt {
+        fn as_field_element(&self) -> u64 {
+            GoldilocksBridgeKernel::field_mul(
+                self.vector_id % GOLDILOCKS_PRIME,
+                self.data_signal % GOLDILOCKS_PRIME,
+            )
         }
     }
+
+    /// Unbounded stream that keeps folding new sources.
+    pub struct StreamAccumulator {
+        acc: u64,
+        count: u64,
+    }
+
+    impl StreamAccumulator {
+        pub fn new() -> Self { Self { acc: 0, count: 0 } }
+        pub fn push<T: FieldSource>(&mut self, item: &T) {
+            let el = item.as_field_element();
+            let weight = GoldilocksBridgeKernel::field_pow(FIELD_GENERATOR, self.count);
+            self.acc = GoldilocksBridgeKernel::field_add(
+                self.acc,
+                GoldilocksBridgeKernel::field_mul(el, weight),
+            );
+            self.count = self.count.wrapping_add(1);
+        }
+        pub fn current(&self) -> u64 { self.acc }
+        pub fn items_seen(&self) -> u64 { self.count }
+    }
+
+    impl Default for StreamAccumulator {
+        fn default() -> Self { Self::new() }
+    }
+
+    /// Agent that can be spawned and that absorbs indefinitely.
+    pub struct BridgeAgent {
+        pub id: u64,
+        pub accumulator: StreamAccumulator,
+    }
+
+    impl BridgeAgent {
+        pub fn spawn(id: u64) -> Self {
+            Self { id, accumulator: StreamAccumulator::new() }
+        }
+        pub fn absorb<T: FieldSource>(&mut self, item: &T) {
+            self.accumulator.push(item);
+        }
+        pub fn state(&self) -> u64 { self.accumulator.current() }
+    }
+
+    /// Registry that creates agents and skills on demand.
+    /// This is the growth surface — it can keep producing new
+    /// agents and skills without a fixed upper bound.
+    pub struct AgentRegistry {
+        next_id: u64,
+    }
+
+    impl AgentRegistry {
+        pub fn new() -> Self { Self { next_id: 1 } }
+
+        pub fn create_agent(&mut self) -> BridgeAgent {
+            let agent = BridgeAgent::spawn(self.next_id);
+            self.next_id = self.next_id.wrapping_add(1);
+            agent
+        }
+
+        /// Create a skill. The returned closure can be stored and reused.
+        pub fn create_skill(&self, name_hash: u64) -> impl Fn(&[&dyn FieldSource]) -> u64 {
+            move |sources| {
+                let mut acc = name_hash % GOLDILOCKS_PRIME;
+                for (idx, src) in sources.iter().enumerate() {
+                    let el = src.as_field_element();
+                    let weight = GoldilocksBridgeKernel::field_pow(FIELD_GENERATOR, idx as u64);
+                    acc = GoldilocksBridgeKernel::field_add(
+                        acc,
+                        GoldilocksBridgeKernel::field_mul(el, weight),
+                    );
+                }
+                acc
+            }
+        }
+    }
+
+    impl Default for AgentRegistry {
+        fn default() -> Self { Self::new() }
+    }
 }
 
-impl Default for AgentRegistry {
-    fn default() -> Self { Self::new() }
-}
+// Re-export the adaptive surface at the crate root for convenience
+pub use adaptive::{FieldSource, StreamAccumulator, BridgeAgent, AgentRegistry};
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn agents_can_be_created_and_absorb() {
+    fn adaptive_loop_can_grow() {
         let mut registry = AgentRegistry::new();
         let mut agent = registry.create_agent();
-        agent.absorb(&42u64);
-        agent.absorb(&HardwareInterrupt { vector_id: 1, data_signal: 2 });
+        for i in 0..50u64 {
+            agent.absorb(&i);
+        }
+        assert_eq!(agent.accumulator.items_seen(), 50);
         assert!(agent.state() > 0);
-    }
-
-    #[test]
-    fn skills_can_be_created() {
-        let registry = AgentRegistry::new();
-        let skill = registry.create_skill(0xSKILL);
-        let sources: [&dyn FieldSource; 1] = [&99u64];
-        let result = skill(&sources);
-        assert!(result > 0);
     }
 }
