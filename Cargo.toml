@@ -1,21 +1,16 @@
 [package]
 name = "mbos-goldilocks-bridge"
-version = "0.1.0"
+version = "0.4.0"
 edition = "2021"
-description = "MBOS-GOLDILOCKS-BRIDGE: Cryptographic HAL for verifiable microkernels"
+description = "Goldilocks-field cryptographic I/O airlock with adaptive local/silent loop"
 license = "MIT OR Apache-2.0"
-
-[lib]
-crate-type = ["lib"]
-
-[[bin]]
-name = "mbos-goldilocks-bridge"
-path = "src/main.rs"
 
 [dependencies]
 
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-panic = "abort"
+[features]
+default = []
+std = []
+
+[lib]
+name = "mbos_goldilocks_bridge"
+path = "src/lib.rs"

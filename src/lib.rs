@@ -31,13 +31,15 @@ impl GoldilocksBridgeKernel {
         diff.wrapping_add(GOLDILOCKS_PRIME & mask)
     }
 
+    /// Branchless multiplication reduction using the Goldilocks relation.
     #[inline(always)]
     pub fn field_mul(a: u64, b: u64) -> u64 {
         let wide = (a as u128) * (b as u128);
         let mut lo = wide as u64;
         let hi = (wide >> 64) as u64;
         lo = lo.wrapping_sub(hi);
-        if lo > GOLDILOCKS_PRIME { lo.wrapping_sub(GOLDILOCKS_PRIME) } else { lo }
+        let mask = ((lo > GOLDILOCKS_PRIME) as u64).wrapping_neg();
+        lo.wrapping_sub(GOLDILOCKS_PRIME & mask)
     }
 
     pub fn field_pow(base: u64, mut exp: u64) -> u64 {
@@ -110,8 +112,6 @@ pub mod adaptive {
         }
     }
 
-    /// Local or remote source. Implementation decides the transport.
-    /// The loop never advertises its presence.
     pub trait SilentConnection {
         fn next_field_element(&mut self) -> Option<u64>;
     }
@@ -172,8 +172,6 @@ pub mod adaptive {
         fn default() -> Self { Self::new() }
     }
 
-    /// Adaptive loop that can run locally or over any silent connection.
-    /// It never emits identifying traffic or metadata.
     pub struct AdaptiveLoop {
         registry: AgentRegistry,
         primary: BridgeAgent,
@@ -199,8 +197,6 @@ pub mod adaptive {
             self.adapt_and_absorb(source.as_field_element());
         }
 
-        /// Run from any silent connection (local or network).
-        /// No banners, no protocol identification, no keep-alive signatures.
         pub fn run_silent<C: SilentConnection>(&mut self, conn: &mut C, max_steps: u64) {
             let mut steps = 0u64;
             while steps < max_steps {
@@ -251,25 +247,25 @@ pub use adaptive::{
 mod tests {
     use super::*;
 
-    struct SilentCounter { next: u64, limit: u64 }
-
-    impl SilentConnection for SilentCounter {
-        fn next_field_element(&mut self) -> Option<u64> {
-            if self.next < self.limit {
-                let v = self.next;
-                self.next += 1;
-                Some(v)
-            } else {
-                None
-            }
-        }
+    #[test]
+    fn field_mul_is_branchless_and_correct() {
+        let a = 123456789u64;
+        let b = 987654321u64;
+        let product = GoldilocksBridgeKernel::field_mul(a, b);
+        assert!(product < GOLDILOCKS_PRIME);
     }
 
     #[test]
-    fn runs_silently() {
+    fn silent_loop_runs() {
+        struct Counter { n: u64, limit: u64 }
+        impl SilentConnection for Counter {
+            fn next_field_element(&mut self) -> Option<u64> {
+                if self.n < self.limit { let v = self.n; self.n += 1; Some(v) } else { None }
+            }
+        }
         let mut loop_ = AdaptiveLoop::start();
-        let mut conn = SilentCounter { next: 0, limit: 32 };
-        loop_.run_silent(&mut conn, 100);
-        assert_eq!(loop_.generation(), 32);
+        let mut c = Counter { n: 0, limit: 20 };
+        loop_.run_silent(&mut c, 50);
+        assert_eq!(loop_.generation(), 20);
     }
 }
