@@ -1,0 +1,37 @@
+[Unit]
+Description=Aequitas Core Adaptive Convergence Engine
+After=network.target local-fs.target
+ConditionPathIsReadWrite=false
+
+[Service]
+Type=simple
+User=aequitas
+Group=aequitas
+
+# Absolute Binary and Working Directory Execution Path
+WorkingDirectory=/opt/Aequitas_Core
+ExecStart=/opt/Aequitas_Core/adaptive_engine
+
+# --- Namespace and Filesystem Hardening ---
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+
+# Restrict Write Access strictly to runtime log directories, leaving the core binary path immutable
+ReadOnlyPaths=/opt/Aequitas_Core
+ReadWritePaths=/opt/Aequitas_Core/state /var/log/aequitas
+
+# Environment Sanitization
+Environment=RUST_BACKTRACE=1
+PassEnvironment=
+
+[Install]
+WantedBy=multi-user.target
