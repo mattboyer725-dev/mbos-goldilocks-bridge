@@ -173,24 +173,41 @@ impl IntegrityAuditor {
         Ok(new_files == 0 && deleted == 0 && modified == 0)
     }
 
+    /// Hard gate: fail if the directory is writable by anyone.
     pub fn assert_read_only(&self) -> io::Result<()> {
-        let meta = fs::metadata(&self.target_dir)?;
-        if meta.permissions().readonly() {
-            Ok(())
-        } else {
-            Err(io::Error::new(io::ErrorKind::PermissionDenied, "target directory is writable"))
+        let metadata = fs::metadata(&self.target_dir)?;
+        let permissions = metadata.permissions();
+
+        if permissions.readonly() {
+            return Ok(());
         }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = permissions.mode();
+            // S_IWUSR | S_IWGRP | S_IWOTH
+            if mode & 0o222 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "Hard gate violation: Target directory '{:?}' is mutable (mode: {:o}).",
+                        self.target_dir, mode
+                    ),
+                ));
+            }
+        }
+
+        Ok(())
     }
 }
 
-/// Hardened boot: sanitize env, require read-only directory, then audit, then run.
 pub fn boot_and_run(node_id: &str, target: u64, dir: &Path) -> Result<(), String> {
     sanitize_loader_env();
 
     let manifest = dir.join("baseline_manifest.json");
     let auditor = IntegrityAuditor::new(dir, &manifest);
 
-    // Hard check: refuse to start if directory is writable
     auditor.assert_read_only()
         .map_err(|e| format!("directory not read-only: {e}"))?;
 
