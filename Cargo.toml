@@ -1,14 +1,14 @@
 [package]
 name = "mbos-goldilocks-bridge"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
-description = "Local-first adaptive loop with optional controlled peer sync"
+description = "Local adaptive loop with pre-flight integrity gate"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 
 [lib]
 name = "mbos_goldilocks_bridge"

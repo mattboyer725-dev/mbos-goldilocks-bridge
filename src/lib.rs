@@ -1,10 +1,9 @@
-//! Local-first adaptive loop.
-//! Optional controlled peer sync: you supply the peer list and can read every node.
-
-use std::sync::{Arc, Mutex};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use serde::{Serialize, Deserialize};
+use sha2::{Sha256, Digest};
 
 pub const GOLDILOCKS_PRIME: u64 = 18446744069414584321;
 
@@ -41,16 +40,10 @@ pub struct AdaptiveLoop {
     adaptation_rate: u64,
     generation: u64,
     target: u64,
-    /// Explicit peer list you control. Empty = local only.
-    peers: Vec<String>,
 }
 
 impl AdaptiveLoop {
-    pub fn start(node_id: impl Into<String>) -> Self {
-        Self::with_target(node_id, 0)
-    }
-
-    pub fn with_target(node_id: impl Into<String>, target: u64) -> Self {
+    pub fn new(node_id: impl Into<String>, target: u64) -> Self {
         Self {
             node_id: node_id.into(),
             acc: 0,
@@ -58,13 +51,7 @@ impl AdaptiveLoop {
             adaptation_rate: 10,
             generation: 0,
             target: target % GOLDILOCKS_PRIME,
-            peers: Vec::new(),
         }
-    }
-
-    /// Add a peer you control (host:port). You must be able to reach and inspect it.
-    pub fn add_peer(&mut self, addr: impl Into<String>) {
-        self.peers.push(addr.into());
     }
 
     pub fn step(&mut self, raw: u64) {
@@ -100,41 +87,102 @@ impl AdaptiveLoop {
         }
     }
 
-    pub fn is_local_only(&self) -> bool { self.peers.is_empty() }
-
-    /// Broadcast current state to the explicit peer list you supplied.
-    /// Returns the number of peers that acknowledged.
-    pub async fn broadcast(&self) -> usize {
-        let payload = serde_json::to_vec(&self.current_state()).unwrap_or_default();
-        let mut acks = 0;
-        for peer in &self.peers {
-            if let Ok(mut stream) = TcpStream::connect(peer).await {
-                if stream.write_all(&payload).await.is_ok() {
-                    let mut buf = [0u8; 8];
-                    if stream.read(&mut buf).await.is_ok() {
-                        acks += 1;
-                    }
-                }
-            }
+    /// Local run for a fixed number of steps. No network.
+    pub fn run_local_steps(&mut self, steps: u64, seed: u64) {
+        for i in 0..steps {
+            self.step(seed.wrapping_add(i));
         }
-        acks
+    }
+}
+
+/// Local file-integrity auditor. Baseline stays on disk under your control.
+pub struct IntegrityAuditor {
+    target_dir: PathBuf,
+    baseline_path: PathBuf,
+}
+
+impl IntegrityAuditor {
+    pub fn new(target_dir: impl AsRef<Path>, baseline_path: impl AsRef<Path>) -> Self {
+        Self {
+            target_dir: target_dir.as_ref().to_path_buf(),
+            baseline_path: baseline_path.as_ref().to_path_buf(),
+        }
     }
 
-    /// Start a listener so other nodes you control can send state to this one.
-    /// You choose the bind address.
-    pub async fn listen(self: Arc<Mutex<Self>>, bind: &str) -> std::io::Result<()> {
-        let listener = TcpListener::bind(bind).await?;
+    fn hash_file(path: &Path) -> io::Result<String> {
+        let mut file = File::open(path)?;
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 65536];
         loop {
-            if let Ok((mut socket, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 1024];
-                if let Ok(n) = socket.read(&mut buf).await {
-                    if let Ok(peer_state) = serde_json::from_slice::<NodeState>(&buf[..n]) {
-                        // Store or log; owner can inspect via current_state()
-                        let _ = peer_state;
-                        let _ = socket.write_all(b"ACK").await;
+            let n = file.read(&mut buf)?;
+            if n == 0 { break; }
+            hasher.update(&buf[..n]);
+        }
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    fn scan(&self) -> io::Result<HashMap<String, String>> {
+        let mut map = HashMap::new();
+        if !self.target_dir.exists() {
+            return Ok(map);
+        }
+        for entry in fs::read_dir(&self.target_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if let Ok(hash) = Self::hash_file(&path) {
+                        map.insert(name.to_string(), hash);
                     }
                 }
             }
         }
+        Ok(map)
     }
+
+    pub fn create_baseline(&self) -> io::Result<()> {
+        let map = self.scan()?;
+        let json = serde_json::to_string_pretty(&map)?;
+        fs::write(&self.baseline_path, json)?;
+        Ok(())
+    }
+
+    /// Returns Ok(true) if clean, Ok(false) if anomalies, Err on I/O failure.
+    pub fn audit(&self) -> io::Result<bool> {
+        if !self.baseline_path.exists() {
+            self.create_baseline()?;
+            return Ok(true);
+        }
+        let baseline: HashMap<String, String> =
+            serde_json::from_str(&fs::read_to_string(&self.baseline_path)?)?;
+        let current = self.scan()?;
+
+        let baseline_keys: std::collections::HashSet<_> = baseline.keys().cloned().collect();
+        let current_keys: std::collections::HashSet<_> = current.keys().cloned().collect();
+
+        let new_files = current_keys.difference(&baseline_keys).count();
+        let deleted = baseline_keys.difference(&current_keys).count();
+        let modified = current_keys.intersection(&baseline_keys)
+            .filter(|k| current.get(*k) != baseline.get(*k))
+            .count();
+
+        Ok(new_files == 0 && deleted == 0 && modified == 0)
+    }
+}
+
+/// Boot gate: refuse to start the loop if integrity fails.
+pub fn boot_and_run(node_id: &str, target: u64, dir: &Path) -> Result<(), String> {
+    let manifest = dir.join("baseline_manifest.json");
+    let auditor = IntegrityAuditor::new(dir, &manifest);
+
+    match auditor.audit() {
+        Ok(true) => {}
+        Ok(false) => return Err("integrity check failed".into()),
+        Err(e) => return Err(format!("audit I/O error: {e}")),
+    }
+
+    let mut node = AdaptiveLoop::new(node_id, target);
+    node.run_local_steps(10, 1);
+    let _ = node.current_state();
+    Ok(())
 }
