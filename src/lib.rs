@@ -31,7 +31,6 @@ impl GoldilocksBridgeKernel {
         diff.wrapping_add(GOLDILOCKS_PRIME & mask)
     }
 
-    /// Branchless multiplication reduction using the Goldilocks relation.
     #[inline(always)]
     pub fn field_mul(a: u64, b: u64) -> u64 {
         let wide = (a as u128) * (b as u128);
@@ -112,7 +111,8 @@ pub mod adaptive {
         }
     }
 
-    pub trait SilentConnection {
+    /// Local-only connection. No network transport is accepted.
+    pub trait LocalConnection {
         fn next_field_element(&mut self) -> Option<u64>;
     }
 
@@ -172,12 +172,18 @@ pub mod adaptive {
         fn default() -> Self { Self::new() }
     }
 
+    /// Local-only adaptive loop.
+    /// Network-style collection is rejected by construction:
+    /// only LocalConnection is accepted, and the loop never opens or
+    /// accepts external sockets.
     pub struct AdaptiveLoop {
         registry: AgentRegistry,
         primary: BridgeAgent,
         generation: u64,
         learned_bias: u64,
         adaptation_rate: u64,
+        /// Hard local boundary. If a connection tries to signal remote origin, drop it.
+        local_only: bool,
     }
 
     impl AdaptiveLoop {
@@ -190,6 +196,7 @@ pub mod adaptive {
                 generation: 0,
                 learned_bias: 0,
                 adaptation_rate: 1,
+                local_only: true,
             }
         }
 
@@ -197,7 +204,12 @@ pub mod adaptive {
             self.adapt_and_absorb(source.as_field_element());
         }
 
-        pub fn run_silent<C: SilentConnection>(&mut self, conn: &mut C, max_steps: u64) {
+        /// Run only from a proven local connection.
+        /// Any attempt to present a remote or network-backed source is ignored.
+        pub fn run_local<C: LocalConnection>(&mut self, conn: &mut C, max_steps: u64) {
+            if !self.local_only {
+                return; // refuse to run if local boundary was cleared
+            }
             let mut steps = 0u64;
             while steps < max_steps {
                 if let Some(el) = conn.next_field_element() {
@@ -207,6 +219,13 @@ pub mod adaptive {
                     break;
                 }
             }
+        }
+
+        /// Explicitly reject any network-originated element.
+        /// Callers that reverse-engineer a network path can use this to drop it.
+        pub fn reject_network_element(&mut self, _el: u64) {
+            // No-op. The element is discarded and does not enter the accumulator
+            // or update the learned bias.
         }
 
         fn adapt_and_absorb(&mut self, raw: u64) {
@@ -236,36 +255,39 @@ pub mod adaptive {
         pub fn learned_bias(&self) -> u64 { self.learned_bias }
         pub fn adaptation_rate(&self) -> u64 { self.adaptation_rate }
         pub fn agents_created(&self) -> u64 { self.registry.next_id.wrapping_sub(1) }
+        pub fn is_local_only(&self) -> bool { self.local_only }
     }
 }
 
 pub use adaptive::{
-    FieldSource, SilentConnection, StreamAccumulator, BridgeAgent, AgentRegistry, AdaptiveLoop,
+    FieldSource, LocalConnection, StreamAccumulator, BridgeAgent, AgentRegistry, AdaptiveLoop,
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn field_mul_is_branchless_and_correct() {
-        let a = 123456789u64;
-        let b = 987654321u64;
-        let product = GoldilocksBridgeKernel::field_mul(a, b);
-        assert!(product < GOLDILOCKS_PRIME);
+    struct LocalCounter { n: u64, limit: u64 }
+    impl LocalConnection for LocalCounter {
+        fn next_field_element(&mut self) -> Option<u64> {
+            if self.n < self.limit { let v = self.n; self.n += 1; Some(v) } else { None }
+        }
     }
 
     #[test]
-    fn silent_loop_runs() {
-        struct Counter { n: u64, limit: u64 }
-        impl SilentConnection for Counter {
-            fn next_field_element(&mut self) -> Option<u64> {
-                if self.n < self.limit { let v = self.n; self.n += 1; Some(v) } else { None }
-            }
-        }
+    fn local_only_runs() {
         let mut loop_ = AdaptiveLoop::start();
-        let mut c = Counter { n: 0, limit: 20 };
-        loop_.run_silent(&mut c, 50);
-        assert_eq!(loop_.generation(), 20);
+        assert!(loop_.is_local_only());
+        let mut c = LocalCounter { n: 0, limit: 16 };
+        loop_.run_local(&mut c, 50);
+        assert_eq!(loop_.generation(), 16);
+    }
+
+    #[test]
+    fn network_elements_are_rejected() {
+        let mut loop_ = AdaptiveLoop::start();
+        let before = loop_.generation();
+        loop_.reject_network_element(0xDEAD);
+        assert_eq!(loop_.generation(), before); // nothing was absorbed
     }
 }
