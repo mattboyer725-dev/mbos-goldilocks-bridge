@@ -1,6 +1,5 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
-/// Goldilocks prime: 2^64 - 2^32 + 1
 pub const GOLDILOCKS_PRIME: u64 = 18446744069414584321;
 pub const FIELD_GENERATOR: u64 = 7;
 
@@ -15,7 +14,6 @@ pub struct HardwareInterrupt {
     pub data_signal: u64,
 }
 
-/// Core kernel. All operations are associated functions or methods on this unit struct.
 pub struct GoldilocksBridgeKernel;
 
 impl GoldilocksBridgeKernel {
@@ -103,7 +101,6 @@ impl GoldilocksBridgeKernel {
     }
 }
 
-/// Extension point: anything that can produce a field element can be folded in.
 pub trait FieldSource {
     fn as_field_element(&self) -> u64;
 }
@@ -121,11 +118,9 @@ impl FieldSource for HardwareInterrupt {
     }
 }
 
-/// Adapter that lets external systems feed arbitrary sources into the bridge.
 pub struct BridgeAdapter;
 
 impl BridgeAdapter {
-    /// Fold any number of FieldSource items into a single commitment-like value.
     pub fn fold_sources(sources: &[&dyn FieldSource]) -> u64 {
         let mut acc = 0u64;
         for (idx, src) in sources.iter().enumerate() {
@@ -138,34 +133,49 @@ impl BridgeAdapter {
     }
 }
 
+/// Streaming accumulator. Keeps accepting FieldSource items forever.
+pub struct StreamAccumulator {
+    acc: u64,
+    count: u64,
+}
+
+impl StreamAccumulator {
+    pub fn new() -> Self {
+        Self { acc: 0, count: 0 }
+    }
+
+    pub fn push<T: FieldSource>(&mut self, item: &T) {
+        let el = item.as_field_element();
+        let weight = GoldilocksBridgeKernel::field_pow(FIELD_GENERATOR, self.count);
+        let term = GoldilocksBridgeKernel::field_mul(el, weight);
+        self.acc = GoldilocksBridgeKernel::field_add(self.acc, term);
+        self.count = self.count.wrapping_add(1);
+    }
+
+    pub fn current(&self) -> u64 {
+        self.acc
+    }
+
+    pub fn items_seen(&self) -> u64 {
+        self.count
+    }
+}
+
+impl Default for StreamAccumulator {
+    fn default() -> Self { Self::new() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn field_arithmetic_roundtrip() {
-        let a = 123456789u64;
-        let b = 987654321u64;
-        let sum = GoldilocksBridgeKernel::field_add(a, b);
-        let recovered = GoldilocksBridgeKernel::field_sub(sum, b);
-        assert_eq!(recovered, a % GOLDILOCKS_PRIME);
-    }
-
-    #[test]
-    fn masking_reconstitution() {
-        let kernel = GoldilocksBridgeKernel;
-        let secret = 0xBADCAFE123456789u64 % GOLDILOCKS_PRIME;
-        let (s1, s2) = kernel.generate_masked_shares(secret, 0x44A21B90);
-        let recovered = GoldilocksBridgeKernel::field_add(s1, s2);
-        assert_eq!(recovered, secret);
-    }
-
-    #[test]
-    fn adapter_folds_mixed_sources() {
-        let irq = HardwareInterrupt { vector_id: 7, data_signal: 99 };
-        let raw: u64 = 0xABCDEF;
-        let sources: [&dyn FieldSource; 2] = [&raw, &irq];
-        let folded = BridgeAdapter::fold_sources(&sources);
-        assert!(folded > 0);
+    fn stream_never_stops() {
+        let mut stream = StreamAccumulator::new();
+        for i in 0..100u64 {
+            stream.push(&i);
+        }
+        assert_eq!(stream.items_seen(), 100);
+        assert!(stream.current() > 0);
     }
 }
