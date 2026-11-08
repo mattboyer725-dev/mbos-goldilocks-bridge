@@ -1,8 +1,8 @@
 [package]
 name = "mbos-goldilocks-bridge"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
-description = "Local-only Goldilocks-field adaptive I/O bridge"
+description = "Local-only Goldilocks adaptive loop with dynamic sensitivity"
 license = "MIT OR Apache-2.0"
 
 [lib]
