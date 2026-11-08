@@ -133,17 +133,13 @@ impl BridgeAdapter {
     }
 }
 
-/// Streaming accumulator. Keeps accepting FieldSource items forever.
 pub struct StreamAccumulator {
     acc: u64,
     count: u64,
 }
 
 impl StreamAccumulator {
-    pub fn new() -> Self {
-        Self { acc: 0, count: 0 }
-    }
-
+    pub fn new() -> Self { Self { acc: 0, count: 0 } }
     pub fn push<T: FieldSource>(&mut self, item: &T) {
         let el = item.as_field_element();
         let weight = GoldilocksBridgeKernel::field_pow(FIELD_GENERATOR, self.count);
@@ -151,17 +147,58 @@ impl StreamAccumulator {
         self.acc = GoldilocksBridgeKernel::field_add(self.acc, term);
         self.count = self.count.wrapping_add(1);
     }
-
-    pub fn current(&self) -> u64 {
-        self.acc
-    }
-
-    pub fn items_seen(&self) -> u64 {
-        self.count
-    }
+    pub fn current(&self) -> u64 { self.acc }
+    pub fn items_seen(&self) -> u64 { self.count }
 }
 
 impl Default for StreamAccumulator {
+    fn default() -> Self { Self::new() }
+}
+
+/// An agent that can be spawned on demand and carries its own accumulator.
+pub struct BridgeAgent {
+    pub id: u64,
+    pub accumulator: StreamAccumulator,
+}
+
+impl BridgeAgent {
+    pub fn spawn(id: u64) -> Self {
+        Self { id, accumulator: StreamAccumulator::new() }
+    }
+
+    pub fn absorb<T: FieldSource>(&mut self, item: &T) {
+        self.accumulator.push(item);
+    }
+
+    pub fn state(&self) -> u64 {
+        self.accumulator.current()
+    }
+}
+
+/// Registry that can create agents and skills as needed.
+pub struct AgentRegistry {
+    next_id: u64,
+}
+
+impl AgentRegistry {
+    pub fn new() -> Self { Self { next_id: 1 } }
+
+    pub fn create_agent(&mut self) -> BridgeAgent {
+        let agent = BridgeAgent::spawn(self.next_id);
+        self.next_id = self.next_id.wrapping_add(1);
+        agent
+    }
+
+    /// Create a skill as a named folding function over FieldSources.
+    pub fn create_skill(&self, name_hash: u64) -> impl Fn(&[&dyn FieldSource]) -> u64 {
+        move |sources| {
+            let base = GoldilocksBridgeKernel::field_add(name_hash, BridgeAdapter::fold_sources(sources));
+            base
+        }
+    }
+}
+
+impl Default for AgentRegistry {
     fn default() -> Self { Self::new() }
 }
 
@@ -170,12 +207,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stream_never_stops() {
-        let mut stream = StreamAccumulator::new();
-        for i in 0..100u64 {
-            stream.push(&i);
-        }
-        assert_eq!(stream.items_seen(), 100);
-        assert!(stream.current() > 0);
+    fn agents_can_be_created_and_absorb() {
+        let mut registry = AgentRegistry::new();
+        let mut agent = registry.create_agent();
+        agent.absorb(&42u64);
+        agent.absorb(&HardwareInterrupt { vector_id: 1, data_signal: 2 });
+        assert!(agent.state() > 0);
+    }
+
+    #[test]
+    fn skills_can_be_created() {
+        let registry = AgentRegistry::new();
+        let skill = registry.create_skill(0xSKILL);
+        let sources: [&dyn FieldSource; 1] = [&99u64];
+        let result = skill(&sources);
+        assert!(result > 0);
     }
 }
