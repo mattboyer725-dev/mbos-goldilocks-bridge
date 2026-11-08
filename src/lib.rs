@@ -1,5 +1,6 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
+/// Goldilocks prime: 2^64 - 2^32 + 1
 pub const GOLDILOCKS_PRIME: u64 = 18446744069414584321;
 pub const FIELD_GENERATOR: u64 = 7;
 
@@ -17,18 +18,23 @@ pub struct HardwareInterrupt {
 pub struct GoldilocksBridgeKernel;
 
 impl GoldilocksBridgeKernel {
+    /// Constant-time addition modulo p
     #[inline(always)]
     pub fn field_add(a: u64, b: u64) -> u64 {
         let sum = a.wrapping_add(b);
-        if sum >= GOLDILOCKS_PRIME { sum.wrapping_sub(GOLDILOCKS_PRIME) } else { sum }
+        let mask = ((sum >= GOLDILOCKS_PRIME) as u64).wrapping_neg();
+        sum.wrapping_sub(GOLDILOCKS_PRIME & mask)
     }
 
+    /// Constant-time subtraction modulo p
     #[inline(always)]
     pub fn field_sub(a: u64, b: u64) -> u64 {
         let diff = a.wrapping_sub(b);
-        if a < b { diff.wrapping_add(GOLDILOCKS_PRIME) } else { diff }
+        let mask = ((a < b) as u64).wrapping_neg();
+        diff.wrapping_add(GOLDILOCKS_PRIME & mask)
     }
 
+    /// Constant-time multiplication modulo p (wide multiply)
     #[inline(always)]
     pub fn field_mul(a: u64, b: u64) -> u64 {
         let wide = (a as u128) * (b as u128);
@@ -89,5 +95,28 @@ impl GoldilocksBridgeKernel {
         let s2 = entropy % GOLDILOCKS_PRIME;
         let s1 = Self::field_sub(secret % GOLDILOCKS_PRIME, s2);
         (s1, s2)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn field_arithmetic_roundtrip() {
+        let a = 123456789u64;
+        let b = 987654321u64;
+        let sum = GoldilocksBridgeKernel::field_add(a, b);
+        let recovered = GoldilocksBridgeKernel::field_sub(sum, b);
+        assert_eq!(recovered, a % GOLDILOCKS_PRIME);
+    }
+
+    #[test]
+    fn masking_reconstitution() {
+        let kernel = GoldilocksBridgeKernel;
+        let secret = 0xBADCAFE123456789u64 % GOLDILOCKS_PRIME;
+        let (s1, s2) = kernel.generate_masked_shares(secret, 0x44A21B90);
+        let recovered = GoldilocksBridgeKernel::field_add(s1, s2);
+        assert_eq!(recovered, secret);
     }
 }
