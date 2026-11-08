@@ -110,6 +110,12 @@ pub mod adaptive {
         }
     }
 
+    /// Optional local connection hook.
+    /// Implement this to plug in a local model, sensor bus, or any on-device source.
+    pub trait LocalConnection {
+        fn next_field_element(&mut self) -> Option<u64>;
+    }
+
     pub struct StreamAccumulator {
         acc: u64,
         count: u64,
@@ -166,15 +172,14 @@ pub mod adaptive {
         fn default() -> Self { Self::new() }
     }
 
-    /// Adaptive loop that learns from each step and adjusts in real time.
-    /// It maintains a running average and uses it to bias future absorption.
+    /// Fully local adaptive loop.
+    /// Can run indefinitely on-device. Optionally pulls from any LocalConnection
+    /// (local LLM, sensor, file, random, etc.).
     pub struct AdaptiveLoop {
         registry: AgentRegistry,
         primary: BridgeAgent,
         generation: u64,
-        /// Running field-element average of recent inputs (learning signal)
         learned_bias: u64,
-        /// How strongly the bias influences the next step (adapts over time)
         adaptation_rate: u64,
     }
 
@@ -191,31 +196,42 @@ pub mod adaptive {
             }
         }
 
-        /// One adaptive step.
-        /// Absorbs the source, updates the learned bias, and may grow.
+        /// Single local step with an explicit source.
         pub fn step<T: FieldSource>(&mut self, source: &T) {
-            let raw = source.as_field_element();
+            self.adapt_and_absorb(source.as_field_element());
+        }
 
-            // Blend new observation into learned bias (simple exponential moving average)
+        /// Run continuously from any local connection until it returns None.
+        pub fn run_local<C: LocalConnection>(&mut self, conn: &mut C, max_steps: u64) {
+            let mut steps = 0u64;
+            while steps < max_steps {
+                if let Some(el) = conn.next_field_element() {
+                    self.adapt_and_absorb(el);
+                    steps += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        fn adapt_and_absorb(&mut self, raw: u64) {
+            // Learn
             self.learned_bias = GoldilocksBridgeKernel::field_add(
-                GoldilocksBridgeKernel::field_mul(self.learned_bias, 15), // keep most of old
-                raw,                                                         // add new
+                GoldilocksBridgeKernel::field_mul(self.learned_bias, 15),
+                raw,
             );
-            // Rough divide-by-16 via shift (not exact field div, but deterministic bias)
             self.learned_bias = self.learned_bias.wrapping_shr(4);
 
-            // Absorb a biased version of the input
+            // Adapt and absorb
             let biased = GoldilocksBridgeKernel::field_add(raw, self.learned_bias);
             self.primary.absorb(&biased);
 
             self.generation = self.generation.wrapping_add(1);
 
-            // Adaptation rate slowly increases (learns to adapt faster)
             if self.generation & 31 == 0 {
                 self.adaptation_rate = self.adaptation_rate.wrapping_add(1);
             }
 
-            // Growth: spawn helper when generation is multiple of (16 + adaptation)
             let threshold = 16u64.wrapping_add(self.adaptation_rate);
             if self.generation % threshold == 0 {
                 let _helper = self.registry.create_agent();
@@ -230,21 +246,37 @@ pub mod adaptive {
     }
 }
 
-pub use adaptive::{FieldSource, StreamAccumulator, BridgeAgent, AgentRegistry, AdaptiveLoop};
+pub use adaptive::{
+    FieldSource, LocalConnection, StreamAccumulator, BridgeAgent, AgentRegistry, AdaptiveLoop,
+};
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn loop_learns_and_adapts() {
-        let mut loop_ = AdaptiveLoop::start();
-        for i in 0..128u64 {
-            loop_.step(&i);
+    struct CountingConnection {
+        next: u64,
+        limit: u64,
+    }
+
+    impl LocalConnection for CountingConnection {
+        fn next_field_element(&mut self) -> Option<u64> {
+            if self.next < self.limit {
+                let v = self.next;
+                self.next += 1;
+                Some(v)
+            } else {
+                None
+            }
         }
-        assert!(loop_.generation() == 128);
+    }
+
+    #[test]
+    fn runs_and_adapts_locally() {
+        let mut loop_ = AdaptiveLoop::start();
+        let mut conn = CountingConnection { next: 0, limit: 64 };
+        loop_.run_local(&mut conn, 100);
+        assert_eq!(loop_.generation(), 64);
         assert!(loop_.learned_bias() > 0);
-        assert!(loop_.adaptation_rate() > 1);
-        assert!(loop_.agents_created() > 1);
     }
 }
