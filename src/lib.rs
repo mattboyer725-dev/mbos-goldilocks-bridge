@@ -90,12 +90,6 @@ impl GoldilocksBridgeKernel {
     }
 }
 
-// ────────────────────────────────────────────────────────────────
-// ADAPTIVE / SELF-LEARNING SURFACE
-// This module is intentionally open-ended. It can grow without
-// touching the fixed cryptographic core above.
-// ────────────────────────────────────────────────────────────────
-
 pub mod adaptive {
     use super::*;
 
@@ -116,7 +110,6 @@ pub mod adaptive {
         }
     }
 
-    /// Unbounded stream that keeps folding new sources.
     pub struct StreamAccumulator {
         acc: u64,
         count: u64,
@@ -141,7 +134,6 @@ pub mod adaptive {
         fn default() -> Self { Self::new() }
     }
 
-    /// Agent that can be spawned and that absorbs indefinitely.
     pub struct BridgeAgent {
         pub id: u64,
         pub accumulator: StreamAccumulator,
@@ -157,23 +149,17 @@ pub mod adaptive {
         pub fn state(&self) -> u64 { self.accumulator.current() }
     }
 
-    /// Registry that creates agents and skills on demand.
-    /// This is the growth surface — it can keep producing new
-    /// agents and skills without a fixed upper bound.
     pub struct AgentRegistry {
         next_id: u64,
     }
 
     impl AgentRegistry {
         pub fn new() -> Self { Self { next_id: 1 } }
-
         pub fn create_agent(&mut self) -> BridgeAgent {
             let agent = BridgeAgent::spawn(self.next_id);
             self.next_id = self.next_id.wrapping_add(1);
             agent
         }
-
-        /// Create a skill. The returned closure can be stored and reused.
         pub fn create_skill(&self, name_hash: u64) -> impl Fn(&[&dyn FieldSource]) -> u64 {
             move |sources| {
                 let mut acc = name_hash % GOLDILOCKS_PRIME;
@@ -193,23 +179,61 @@ pub mod adaptive {
     impl Default for AgentRegistry {
         fn default() -> Self { Self::new() }
     }
+
+    /// Adaptive loop. It keeps running, absorbs new sources,
+    /// and can spawn additional agents as it grows.
+    pub struct AdaptiveLoop {
+        registry: AgentRegistry,
+        primary: BridgeAgent,
+        generation: u64,
+    }
+
+    impl AdaptiveLoop {
+        pub fn start() -> Self {
+            let mut registry = AgentRegistry::new();
+            let primary = registry.create_agent();
+            Self { registry, primary, generation: 0 }
+        }
+
+        /// Run one step: absorb a source and optionally grow.
+        pub fn step<T: FieldSource>(&mut self, source: &T) {
+            self.primary.absorb(source);
+            self.generation = self.generation.wrapping_add(1);
+
+            // Every 16 steps, spawn a helper agent (growth)
+            if self.generation & 15 == 0 {
+                let _helper = self.registry.create_agent();
+            }
+        }
+
+        pub fn current_state(&self) -> u64 {
+            self.primary.state()
+        }
+
+        pub fn generation(&self) -> u64 {
+            self.generation
+        }
+
+        pub fn agents_created(&self) -> u64 {
+            self.registry.next_id.wrapping_sub(1)
+        }
+    }
 }
 
-// Re-export the adaptive surface at the crate root for convenience
-pub use adaptive::{FieldSource, StreamAccumulator, BridgeAgent, AgentRegistry};
+pub use adaptive::{FieldSource, StreamAccumulator, BridgeAgent, AgentRegistry, AdaptiveLoop};
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn adaptive_loop_can_grow() {
-        let mut registry = AgentRegistry::new();
-        let mut agent = registry.create_agent();
-        for i in 0..50u64 {
-            agent.absorb(&i);
+    fn adaptive_loop_grows() {
+        let mut loop_ = AdaptiveLoop::start();
+        for i in 0..64u64 {
+            loop_.step(&i);
         }
-        assert_eq!(agent.accumulator.items_seen(), 50);
-        assert!(agent.state() > 0);
+        assert_eq!(loop_.generation(), 64);
+        assert!(loop_.agents_created() > 1); // it spawned helpers
+        assert!(loop_.current_state() > 0);
     }
 }
