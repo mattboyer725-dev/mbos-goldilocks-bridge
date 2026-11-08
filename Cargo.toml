@@ -1,15 +1,9 @@
 [package]
 name = "mbos-goldilocks-bridge"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
-description = "Goldilocks-field cryptographic I/O airlock with adaptive local/silent loop"
+description = "Local-only Goldilocks-field adaptive I/O bridge"
 license = "MIT OR Apache-2.0"
-
-[dependencies]
-
-[features]
-default = []
-std = []
 
 [lib]
 name = "mbos_goldilocks_bridge"
