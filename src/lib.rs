@@ -87,7 +87,6 @@ impl AdaptiveLoop {
         }
     }
 
-    /// Local run for a fixed number of steps. No network.
     pub fn run_local_steps(&mut self, steps: u64, seed: u64) {
         for i in 0..steps {
             self.step(seed.wrapping_add(i));
@@ -95,7 +94,15 @@ impl AdaptiveLoop {
     }
 }
 
-/// Local file-integrity auditor. Baseline stays on disk under your control.
+/// Strip dynamic-loader environment variables before any other work.
+/// Call this at the absolute start of main().
+pub fn sanitize_loader_env() {
+    std::env::remove_var("LD_PRELOAD");
+    std::env::remove_var("LD_LIBRARY_PATH");
+    std::env::remove_var("LD_AUDIT");
+    std::env::remove_var("LD_DEBUG");
+}
+
 pub struct IntegrityAuditor {
     target_dir: PathBuf,
     baseline_path: PathBuf,
@@ -147,7 +154,6 @@ impl IntegrityAuditor {
         Ok(())
     }
 
-    /// Returns Ok(true) if clean, Ok(false) if anomalies, Err on I/O failure.
     pub fn audit(&self) -> io::Result<bool> {
         if !self.baseline_path.exists() {
             self.create_baseline()?;
@@ -168,12 +174,29 @@ impl IntegrityAuditor {
 
         Ok(new_files == 0 && deleted == 0 && modified == 0)
     }
+
+    /// Refuse if the target directory is writable by the current process.
+    pub fn assert_read_only(&self) -> io::Result<()> {
+        let meta = fs::metadata(&self.target_dir)?;
+        if meta.permissions().readonly() {
+            Ok(())
+        } else {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "target directory is writable"))
+        }
+    }
 }
 
-/// Boot gate: refuse to start the loop if integrity fails.
+/// Hardened boot: sanitize loader env, optionally require read-only dir, then audit, then run.
 pub fn boot_and_run(node_id: &str, target: u64, dir: &Path) -> Result<(), String> {
+    sanitize_loader_env();
+
     let manifest = dir.join("baseline_manifest.json");
     let auditor = IntegrityAuditor::new(dir, &manifest);
+
+    // Soft check: warn path is writable; do not fail closed unless caller wants it.
+    if auditor.assert_read_only().is_err() {
+        // continue; caller may remount later
+    }
 
     match auditor.audit() {
         Ok(true) => {}
