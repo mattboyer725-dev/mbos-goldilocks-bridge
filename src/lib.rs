@@ -18,7 +18,6 @@ pub struct HardwareInterrupt {
 pub struct GoldilocksBridgeKernel;
 
 impl GoldilocksBridgeKernel {
-    /// Constant-time addition modulo p
     #[inline(always)]
     pub fn field_add(a: u64, b: u64) -> u64 {
         let sum = a.wrapping_add(b);
@@ -26,7 +25,6 @@ impl GoldilocksBridgeKernel {
         sum.wrapping_sub(GOLDILOCKS_PRIME & mask)
     }
 
-    /// Constant-time subtraction modulo p
     #[inline(always)]
     pub fn field_sub(a: u64, b: u64) -> u64 {
         let diff = a.wrapping_sub(b);
@@ -34,11 +32,20 @@ impl GoldilocksBridgeKernel {
         diff.wrapping_add(GOLDILOCKS_PRIME & mask)
     }
 
-    /// Constant-time multiplication modulo p (wide multiply)
+    /// Wider reduction for multiplication. Still not fully constant-time on the final mod,
+    /// but avoids a generic division in the hot path.
     #[inline(always)]
     pub fn field_mul(a: u64, b: u64) -> u64 {
         let wide = (a as u128) * (b as u128);
-        (wide % GOLDILOCKS_PRIME as u128) as u64
+        let mut lo = wide as u64;
+        let hi = (wide >> 64) as u64;
+        // Approximate reduction using the Goldilocks relation 2^64 ≡ 2^32 - 1
+        lo = lo.wrapping_sub(hi);
+        if lo > GOLDILOCKS_PRIME { // note: still has a branch
+            lo.wrapping_sub(GOLDILOCKS_PRIME)
+        } else {
+            lo
+        }
     }
 
     pub fn field_pow(base: u64, mut exp: u64) -> u64 {
